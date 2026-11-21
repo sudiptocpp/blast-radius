@@ -26,7 +26,9 @@ def _resolve_module_file(mod_name: str, existing_mods: dict[str, str]) -> str | 
 
 
 def _walk_non_tc_imports(node: ast.AST):
-    """Yield Import/ImportFrom nodes excluding `if TYPE_CHECKING:` branches."""
+    """Yield module-level Import/ImportFrom nodes excluding `if TYPE_CHECKING:` and function bodies."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return
     if isinstance(node, ast.If):
         t = node.test
         is_tc = (isinstance(t, ast.Name) and t.id == "TYPE_CHECKING") or (
@@ -164,7 +166,9 @@ def compute_static_importers(checkout: Path) -> tuple[dict[str, list[str]], dict
 
 
 def build_tpcds_and_tpch_baseline(checkout: Path) -> dict:
-    from sqlglot import parse_one, transpile
+    from runner import collect_plan_py_info
+    from sqlglot import exp, find_tables, parse_one, planner, transpile
+    from sqlglot.executor.python import PythonExecutor
     from sqlglot.optimizer import optimize
     from sqlglot.planner import Plan
     from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
@@ -181,12 +185,18 @@ def build_tpcds_and_tpch_baseline(checkout: Path) -> dict:
         if args.get("execute"):
             opt = optimize(p, schema=TPCDS_SCHEMA)
             opt_repr = repr(opt)
-            plan_repr = repr(Plan(opt))
+            plan = Plan(opt)
+            plan_repr = repr(plan)
+            py_exec = PythonExecutor()
+            py_sig = (
+                tuple(sorted(t.name for t in find_tables(p))),
+                *collect_plan_py_info(py_exec, plan, exp, planner),
+            )
             duck_sql = transpile(sql, write="duckdb")[0]
             df = TestExecutor.tpcds_conn.execute(duck_sql).fetchdf()
-            tpcds.append((p_repr, opt_repr, plan_repr, duck_sql, df))
+            tpcds.append((p_repr, opt_repr, plan_repr, duck_sql, py_sig, df))
         else:
-            tpcds.append((p_repr, None, None, None, None))
+            tpcds.append((p_repr, None, None, None, None, None))
 
     tpch_opt = [
         (transpile(sql, write="duckdb")[0], transpile(opt, write="duckdb")[0])
@@ -455,18 +465,14 @@ def main() -> None:
     print("Tracing isolated import executions...", file=sys.stderr)
     import_trace = compute_import_trace(checkout)
 
+    print("Building TPC-DS/TPC-H baselines...", file=sys.stderr)
+    exec_base = build_tpcds_and_tpch_baseline(checkout)
+
     if args.reuse_from is not None and args.reuse_from.resolve().exists():
         prev = pickle.loads(zlib.decompress(args.reuse_from.resolve().read_bytes()))
         baseline_cpu_ms = prev["baseline_cpu_ms"]
         mac_bench_ms = bench_cpu_loop()
-        exec_base = {
-            "tpcds": prev["tpcds"],
-            "tpch_opt": prev["tpch_opt"],
-            "tpch_exec_count": prev["tpch_exec_count"],
-        }
     else:
-        print("Building TPC-DS/TPC-H baselines...", file=sys.stderr)
-        exec_base = build_tpcds_and_tpch_baseline(checkout)
         print(f"Measuring baseline CPU across {len(test_ids)} tests...", file=sys.stderr)
         baseline_cpu_ms = measure_baseline_cpu(checkout, test_ids)
         mac_bench_ms = bench_cpu_loop()

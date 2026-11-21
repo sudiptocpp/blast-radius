@@ -536,13 +536,10 @@ class Index:
             return -1
         return resource.get("mask", 0) | col
 
-    def dialect_users_mask(self, path: str) -> int:
-        if path in DIALECT_BASE_FILES or not path.startswith(DIALECT_DIRS):
-            return -1
-        return self.module_users_mask(path)
-
-    def _single_module_mask(self, path: str) -> int:
-        mask = self.module_usage.get(path, 0) | self.static_importers_mask.get(path, 0)
+    def _single_module_mask(self, path: str, include_static: bool = True) -> int:
+        mask = self.module_usage.get(path, 0)
+        if include_static:
+            mask |= self.static_importers_mask.get(path, 0)
         for covered in self.func_lines.get(path, {}).values():
             mask |= covered
         for covered in self.init_lines.get(path, {}).values():
@@ -558,6 +555,27 @@ class Index:
                 return -1
             mask |= cm
         return mask
+
+    def dialect_users_mask(self, path: str) -> int:
+        if path in DIALECT_BASE_FILES or not path.startswith(DIALECT_DIRS):
+            return -1
+        # Dialect class dict/scalar edits only affect runtime users + test_dialect itself,
+        # avoiding unrelated dialect files pulled in via test_dialect.py's static imports.
+        mask = self._single_module_mask(path, include_static=False)
+        if mask < 0:
+            return -1
+        res_m = self.resource_users_mask(path)
+        if res_m < 0:
+            return -1
+        mask |= res_m | self.test_files_mask.get("tests/dialects/test_dialect.py", 0)
+        for imp in self.sqlglot_importers.get(path, ()):
+            if imp in CORE_BASE_FILES:
+                return -1
+            im = self._single_module_mask(imp, include_static=False)
+            if im < 0:
+                return -1
+            mask |= im
+        return mask if mask else -1
 
     def module_users_mask(self, path: str) -> int:
         if path in CORE_BASE_FILES:

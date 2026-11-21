@@ -441,11 +441,26 @@ def _strip_type_checking_in_body(stmts: list[ast.stmt]) -> list[ast.stmt]:
     return out
 
 
+def _strip_docstring_in_body(stmts: list[ast.stmt]) -> list[ast.stmt]:
+    if (
+        stmts
+        and isinstance(stmts[0], ast.Expr)
+        and isinstance(stmts[0].value, ast.Constant)
+        and isinstance(stmts[0].value.value, str)
+    ):
+        if len(stmts) == 1:
+            return [ast.Pass()]
+        return stmts[1:]
+    return stmts
+
+
 def _normalize_annotations_and_tc(
-    tree: ast.AST, strip_annotations: bool, strip_tc: bool
+    tree: ast.AST, strip_annotations: bool, strip_tc: bool, strip_docstrings: bool = False
 ) -> ast.AST:
     cloned = copy.deepcopy(tree)
     for node in ast.walk(cloned):
+        if strip_docstrings and isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.body = _strip_docstring_in_body(node.body)
         if strip_tc:
             for attr in ("body", "orelse", "finalbody"):
                 stmts = getattr(node, attr, None)
@@ -480,9 +495,10 @@ def is_semantically_equivalent(path: str, old_tree: ast.AST, new_tree: ast.AST, 
         and _has_future_annotations(old_tree)
         and _has_future_annotations(new_tree)
     )
-    if strip_tc or strip_ann:
-        norm_old = _normalize_annotations_and_tc(old_tree, strip_ann, strip_tc)
-        norm_new = _normalize_annotations_and_tc(new_tree, strip_ann, strip_tc)
+    strip_docs = path.startswith("sqlglot/")
+    if strip_tc or strip_ann or strip_docs:
+        norm_old = _normalize_annotations_and_tc(old_tree, strip_ann, strip_tc, strip_docs)
+        norm_new = _normalize_annotations_and_tc(new_tree, strip_ann, strip_tc, strip_docs)
         if ast_equal(norm_old, norm_new):
             return True
     else:

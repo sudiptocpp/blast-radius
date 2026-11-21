@@ -36,20 +36,8 @@ TEST_OPTIMIZED_TPCH = "tests/test_executor.py::TestExecutor::test_optimized_tpch
 TEST_EXECUTE_TPCH = "tests/test_executor.py::TestExecutor::test_execute_tpch"
 TEST_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
 
-TPCDS_EXEC_SENSITIVE_PREFIXES = ("sqlglot/executor/", "sqlglot/expressions/")
-TPCDS_EXEC_SENSITIVE_FILES = frozenset({
-    "sqlglot/__init__.py",
-    "sqlglot/dialects/dialect.py",
-    "sqlglot/dialects/python.py",
-    "sqlglot/errors.py",
-    "sqlglot/generator.py",
-    "sqlglot/generators/python.py",
-    "sqlglot/helper.py",
-    "sqlglot/optimizer/scope.py",
-    "sqlglot/planner.py",
-    "sqlglot/schema.py",
-    "sqlglot/tokens.py",
-})
+TPCDS_EXEC_SENSITIVE_PREFIXES = ("sqlglot/executor/",)
+TPCDS_EXEC_SENSITIVE_FILES = frozenset()
 EXECUTOR_FIXTURE_FILES = frozenset({
     "tests/test_executor.py",
     "tests/helpers.py",
@@ -282,6 +270,105 @@ def _parse_test_id(test_id: str) -> tuple[str, str, str]:
     return mod_name, cls_name, meth_name
 
 
+def collect_plan_py_info(executor, plan, exp_mod, planner_mod) -> tuple:
+    """Collect deterministic Python code & schema signatures generated from `plan` without scanning rows."""
+    out_sqls: list[str] = []
+    out_meta: list = []
+
+    def gen_str(expr):
+        if not expr:
+            return None
+        replaced = executor._replace_subqueries(expr)
+        return executor.generator.generate(replaced)
+
+    key_cache: dict[int, tuple] = {}
+
+    def step_key(n):
+        nid = id(n)
+        res = key_cache.get(nid)
+        if res is not None:
+            return res
+        src = getattr(n, "source", None)
+        src_name = (src.name or src.alias) if isinstance(src, exp_mod.Expr) else (str(src) if src else "")
+        dep_keys = tuple(sorted(step_key(d) for d in n.dependencies))
+        res = (type(n).__name__, n.name or "", src_name, dep_keys)
+        key_cache[nid] = res
+        return res
+
+    def walk_plan(pl):
+        old_ctes = executor._ctes
+        executor._ctes = pl.ctes
+        try:
+            seen_sub = set(executor._subquery_plans.keys())
+            visited = set()
+            ordered = []
+
+            def visit(n):
+                nid = id(n)
+                if nid in visited:
+                    return
+                visited.add(nid)
+                for dep in sorted(n.dependencies, key=step_key):
+                    visit(dep)
+                ordered.append(n)
+
+            visit(pl.root)
+            for node in ordered:
+                out_meta.append((type(node).__name__, node.name, node.offset, node.limit, len(node.dependencies)))
+                if isinstance(node, planner_mod.Scan):
+                    src = node.source
+                    if src and isinstance(src, exp_mod.Expr):
+                        src = src.name or src.alias
+                    out_meta.append(src)
+                    out_sqls.append(gen_str(node.condition))
+                    for p in node.projections:
+                        out_meta.append(p.alias_or_name if isinstance(p, exp_mod.Expr) else p)
+                        out_sqls.append(gen_str(p))
+                elif isinstance(node, planner_mod.Aggregate):
+                    for k, g in node.group.items():
+                        out_meta.append(k)
+                        out_sqls.append(gen_str(g))
+                    for a in node.aggregations:
+                        out_meta.append(a.alias_or_name if isinstance(a, exp_mod.Expr) else a)
+                        out_sqls.append(gen_str(a))
+                    for op in node.operands:
+                        out_meta.append(op.alias_or_name if isinstance(op, exp_mod.Expr) else op)
+                        out_sqls.append(gen_str(op))
+                    out_sqls.append(gen_str(node.condition))
+                    for p in node.projections:
+                        out_meta.append(p.alias_or_name if isinstance(p, exp_mod.Expr) else p)
+                        out_sqls.append(gen_str(p))
+                elif isinstance(node, planner_mod.Join):
+                    out_meta.append(node.source_name)
+                    for jname, join in node.joins.items():
+                        out_meta.append((jname, join.get("dir"), join.get("side"), join.get("kind")))
+                        out_sqls.append(gen_str(join["condition"]))
+                        for k in join.get("source_key", ()):
+                            out_sqls.append(gen_str(k))
+                        for k in join.get("join_key", ()):
+                            out_sqls.append(gen_str(k))
+                    out_sqls.append(gen_str(node.condition))
+                    for p in node.projections:
+                        out_meta.append(p.alias_or_name if isinstance(p, exp_mod.Expr) else p)
+                        out_sqls.append(gen_str(p))
+                elif isinstance(node, planner_mod.Sort):
+                    for p in node.projections:
+                        out_meta.append(p.alias_or_name if isinstance(p, exp_mod.Expr) else p)
+                        out_sqls.append(gen_str(p))
+                    for k in node.key:
+                        out_sqls.append(gen_str(k))
+                elif isinstance(node, planner_mod.SetOperation):
+                    out_meta.append((node.left, node.right, getattr(node.op, "__name__", str(node.op)), node.distinct))
+            new_subs = sorted(k for k in executor._subquery_plans if k not in seen_sub)
+            for k in new_subs:
+                walk_plan(executor._subquery_plans[k][0])
+        finally:
+            executor._ctes = old_ctes
+
+    walk_plan(plan)
+    return tuple(out_sqls), tuple(out_meta)
+
+
 class _ChildRunner:
     def __init__(self, checkout: Path, patched_files: dict[str, bytes | None], index=None):
         self.checkout = checkout
@@ -362,13 +449,15 @@ class _ChildRunner:
         import duckdb
         import numpy as np
         import pandas as pd
-        from sqlglot import find_tables, parse_one, transpile
+        from sqlglot import exp, find_tables, parse_one, planner, transpile
         from sqlglot.executor import execute
+        from sqlglot.executor.python import PythonExecutor
         from sqlglot.executor.table import Table
         from sqlglot.optimizer import optimize
+        from sqlglot.planner import Plan
         from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
 
-        can_skip_unchanged_exec = not any(
+        exec_runtime_dirty = any(
             p.startswith(TPCDS_EXEC_SENSITIVE_PREFIXES) or p in TPCDS_EXEC_SENSITIVE_FILES
             for p in self.patched_files
         )
@@ -444,7 +533,7 @@ class _ChildRunner:
                 if not pickle_checked:
                     pickle.loads(pickle.dumps(p))
                     pickle_checked = True
-                _, base_opt, _, base_duck_sql, base_df = baseline[i]
+                _, base_opt, base_plan, base_duck_sql, base_py_sig, base_df = baseline[i]
                 opt = optimize(p, schema=TPCDS_SCHEMA)
                 if check_expr_pickle and pickle_checked:
                     pickle.loads(pickle.dumps(opt))
@@ -452,8 +541,18 @@ class _ChildRunner:
                 duck_sql = transpile(sql, write="duckdb")[0]
                 if repr(opt) != base_opt or duck_sql != base_duck_sql:
                     run_exec_item(p, duck_sql, base_duck_sql, base_df)
-                elif not can_skip_unchanged_exec:
+                    continue
+                if exec_runtime_dirty:
                     deferred.append((p, duck_sql, base_duck_sql, base_df))
+                    continue
+                plan = Plan(opt)
+                py_exec = PythonExecutor()
+                py_sig = (
+                    tuple(sorted(t.name for t in find_tables(p))),
+                    *collect_plan_py_info(py_exec, plan, exp, planner),
+                )
+                if py_sig != base_py_sig:
+                    run_exec_item(p, duck_sql, base_duck_sql, base_df)
 
             for p, duck_sql, base_duck_sql, base_df in deferred:
                 run_exec_item(p, duck_sql, base_duck_sql, base_df)
@@ -623,7 +722,7 @@ def _est_cpu_ms(
         return round(30 * speed_ratio)
     if test_id == TEST_EXECUTE_TPCDS and tpcds_fast_avail:
         if not any(p.startswith(TPCDS_EXEC_SENSITIVE_PREFIXES) or p in TPCDS_EXEC_SENSITIVE_FILES for p in patched_files):
-            return round(1_500 * speed_ratio)
+            return round(1_800 * speed_ratio)
         return round(12_500 * speed_ratio)
     if test_id == TEST_OPTIMIZED_TPCH and tpch_fast_avail:
         return round(30 * speed_ratio)
@@ -723,7 +822,7 @@ def _spawn_child(
             max_nodes_num = None
             for num in U:
                 tid, dur, est, mac = by_num[num]
-                if tid in NON_VERIFIABLE_IDS or est >= 0.90 * (dur + 2_000):
+                if tid in NON_VERIFIABLE_IDS or est >= 0.95 * (dur + 2_000):
                     permanent.add(num)
                 elif tid == TEST_MAX_NODES:
                     max_nodes_num = num
@@ -751,28 +850,33 @@ def _spawn_child(
                 if max_nodes_num is not None and max_nodes_num in U:
                     mn_est = by_num[max_nodes_num][2]
                     mn_upper = schedule_cost_ms(permanent | {max_nodes_num}, durations_ms) - perm_cost
-                    if mn_est >= 0.85 * mn_upper:
+                    if mn_est >= 0.95 * mn_upper:
                         eff_perm.add(max_nodes_num)
 
             _refresh_eff_perm()
-            n_run = 0
-            n_pass = 0
-            n_fail = 0
+            n_small_run = 0
+            n_small_pass = 0
+            n_small_fail = 0
             passes_since_check = 0
+
+            def _current_p_est(rem_len: int) -> float:
+                if n_small_run >= 16 and n_small_fail >= 12 and rem_len >= 16:
+                    return (n_small_pass + 2.0) / (n_small_run + 4.0)
+                return 1.0
 
             def _should_stop_prefix() -> bool:
                 rem = [x for x in verifiable if x in U and x not in eff_perm]
                 if not rem:
                     return True
                 rem_no_max = [x for x in rem if x != max_nodes_num]
-                p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4 and len(rem) >= 12) else 1.0
+                p_est = _current_p_est(len(rem))
                 if rem_no_max:
                     if _best_prefix_net(F | U, cur_cost, rem_no_max, by_num, durations_ms, p_est) > 0:
                         return False
                 if max_nodes_num is not None and max_nodes_num in U and max_nodes_num not in eff_perm:
                     mn_est = by_num[max_nodes_num][2]
                     mn_marg = cur_cost - schedule_cost_ms((F | U) - {max_nodes_num}, durations_ms)
-                    if mn_est < 0.85 * p_est * mn_marg:
+                    if mn_est < 0.95 * mn_marg:
                         return False
                 return True
 
@@ -792,33 +896,41 @@ def _spawn_child(
                 if tid == TEST_MAX_NODES:
                     cur_cost = schedule_cost_ms(F | U, durations_ms)
                     marginal_sim = cur_cost - schedule_cost_ms((F | U) - {num}, durations_ms)
-                    p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4) else 1.0
-                    threshold = 0.90 if (not permanent and len(U) == 1) else 0.85
-                    if est >= threshold * p_est * marginal_sim:
+                    if est >= 0.95 * marginal_sim:
                         continue
                 elif est >= 0.92 * dur or (eff_perm and len(U) <= 40):
                     cur_set = F | U
                     marginal_sim = cur_cost - schedule_cost_ms(cur_set - {num}, durations_ms)
                     if marginal_sim <= 0:
                         continue
-                    if eff_perm and est > 0.92 * marginal_sim:
+                    if eff_perm and est > 0.95 * marginal_sim:
                         rem = [x for x in verifiable if x in U and x not in eff_perm and x != max_nodes_num]
-                        p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4 and len(rem) >= 12) else 1.0
+                        p_est = _current_p_est(len(rem))
                         if _best_prefix_net(cur_set, cur_cost, rem, by_num, durations_ms, p_est) <= 0:
                             break
                         continue
 
+                mod_name = tid.split("::", 1)[0][:-3].replace("/", ".")
+                was_warm = mod_name in runner.loaded_modules
                 t_before = _child_cpu_ms()
                 ok = runner.run_one(tid)
                 t_after = _child_cpu_ms()
                 dt = max(0, t_after - t_before)
-                n_run += 1
-                if mac > 20 and tid not in (TEST_EXECUTE_TPCDS, TEST_OPTIMIZED_TPCH, TEST_EXECUTE_TPCH, TEST_MAX_NODES):
+                if dur < 300:
+                    n_small_run += 1
+                    if ok:
+                        n_small_pass += 1
+                    else:
+                        n_small_fail += 1
+                if (
+                    was_warm
+                    and mac > 20
+                    and tid not in (TEST_EXECUTE_TPCDS, TEST_OPTIMIZED_TPCH, TEST_EXECUTE_TPCH, TEST_MAX_NODES)
+                ):
                     cal_actual += dt
                     cal_mac += mac
 
                 if ok:
-                    n_pass += 1
                     U.remove(num)
                     passes_since_check += 1
                     if len(U) <= 60 or permanent or passes_since_check >= 12:
@@ -827,7 +939,6 @@ def _spawn_child(
                         if _should_stop_prefix():
                             break
                 else:
-                    n_fail += 1
                     U.remove(num)
                     F.add(num)
                     permanent.add(num)
@@ -937,9 +1048,9 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
     total_cpu_ms = 0
     if getattr(index, "mac_bench_ms", 0) > 0:
         cur_bench = _bench_cpu_loop()
-        speed_ratio = max(0.7, min(2.4, cur_bench / index.mac_bench_ms))
+        speed_ratio = max(0.7, min(1.85, cur_bench / index.mac_bench_ms))
     else:
-        speed_ratio = 1.6  # Conservative initial ratio (server CPU vs Mac baseline)
+        speed_ratio = 1.4  # Conservative initial ratio (server CPU vs Mac baseline)
     cal_actual_total = 0
     cal_mac_total = 0
 
@@ -978,7 +1089,7 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
             est = _est_cpu_ms(tid, dur, mac or None, cov, speed_ratio, pf, tpcds_fast, tpch_fast)
             items.append((num, tid, dur, est, mac))
             if num in unverified:
-                if tid in NON_VERIFIABLE_IDS or est >= 0.90 * (dur + 2_000):
+                if tid in NON_VERIFIABLE_IDS or est >= 0.95 * (dur + 2_000):
                     permanent.add(num)
                 elif tid == TEST_MAX_NODES:
                     max_nodes_num = num
@@ -997,7 +1108,7 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
             if max_nodes_num is not None
             else 0
         )
-        mn_viable = max_nodes_num is not None and by_num[max_nodes_num][2] < 0.85 * mn_upper
+        mn_viable = max_nodes_num is not None and by_num[max_nodes_num][2] < 0.95 * mn_upper
         rem_no_max = sorted(
             (x for x in verifiable if x != max_nodes_num),
             key=lambda n: _verifiable_sort_key(n, by_num),
@@ -1015,7 +1126,13 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
 
     def run_stage(stage_jobs: list[dict]) -> None:
         nonlocal total_cpu_ms, speed_ratio, cal_actual_total, cal_mac_total
-        stage_jobs.sort(key=lambda j: -j["_init_cost"])
+        # Run non-max_nodes jobs first so speed_ratio calibrates on real tests before deciding on test_max_nodes
+        stage_jobs.sort(
+            key=lambda j: (
+                1 if any(index.test_ids[n] == TEST_MAX_NODES for n in (j["selected"] - j.get("fixed_fails", set()))) else 0,
+                -j["_init_cost"],
+            )
+        )
 
         import selectors
         sel_io = selectors.DefaultSelector()
