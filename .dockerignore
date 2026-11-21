@@ -1,0 +1,10 @@
+**
+!build_coverage.py
+!coverage.pkl.zlib
+!equiv.py
+!extra_index.pkl.zlib
+!patches.py
+!requirements.lock
+!runner.py
+!schedule.py
+!selector.py
