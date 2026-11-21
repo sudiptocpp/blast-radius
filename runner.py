@@ -531,6 +531,16 @@ class _ChildRunner:
                 Dialect._classes.update(saved_dialects)
 
 
+def _bench_cpu_loop() -> int:
+    t0 = resource.getrusage(resource.RUSAGE_SELF)
+    acc = 0
+    for _ in range(15):
+        acc += sum(i * i for i in range(40_000))
+    t1 = resource.getrusage(resource.RUSAGE_SELF)
+    _ = acc
+    return max(1, round(((t1.ru_utime - t0.ru_utime) + (t1.ru_stime - t0.ru_stime)) * 1000))
+
+
 def _child_cpu_ms() -> int:
     r = resource.getrusage(resource.RUSAGE_SELF)
     return round((r.ru_utime + r.ru_stime) * 1000)
@@ -609,11 +619,11 @@ def _spawn_child(
                     permanent.add(num)
                 elif tid == TEST_MAX_NODES:
                     max_nodes_num = num
-                    if est < 0.85 * dur:
+                    if est < 0.90 * (dur + 2_000):
                         verifiable.append(num)
                     else:
                         permanent.add(num)
-                elif est >= dur and dur > 300:
+                elif est >= 0.90 * (dur + 2_000):
                     permanent.add(num)
                 else:
                     verifiable.append(num)
@@ -626,23 +636,19 @@ def _spawn_child(
                     if max_nodes_num in verifiable:
                         verifiable.remove(max_nodes_num)
 
-            # Run test_lazy_load FIRST (while sqlglot is still cold!) if present
-            if any(by_num[n][0] == TEST_LAZY_LOAD for n in verifiable):
-                verifiable.sort(
-                    key=lambda n: (
-                        0 if by_num[n][0] == TEST_LAZY_LOAD else 1,
-                        -by_num[n][1],
-                        by_num[n][2],
-                        by_num[n][0].rsplit("::", 1)[0],
-                    )
+            # Run test_lazy_load FIRST (cold sqlglot), fast/heavy tests next, and full test_max_nodes LAST
+            verifiable.sort(
+                key=lambda n: (
+                    0 if by_num[n][0] == TEST_LAZY_LOAD else (2 if by_num[n][0] == TEST_MAX_NODES else 1),
+                    -by_num[n][1],
+                    by_num[n][2],
+                    by_num[n][0].rsplit("::", 1)[0],
                 )
-            else:
-                verifiable.sort(
-                    key=lambda n: (-by_num[n][1], by_num[n][2], by_num[n][0].rsplit("::", 1)[0])
-                )
+            )
 
             cur_cost = schedule_cost_ms(F | U, durations_ms)
             perm_cost = schedule_cost_ms(permanent, durations_ms)
+            passes_since_cost = 0
 
             for num in verifiable:
                 if num not in U:
@@ -654,7 +660,14 @@ def _spawn_child(
                     break
 
                 tid, dur, est, mac = by_num[num]
-                if permanent and len(U) <= 60:
+                if tid == TEST_MAX_NODES:
+                    # Recompute exact marginal gain right before committing ~13-27s CPU to test_max_nodes
+                    cur_cost = schedule_cost_ms(F | U, durations_ms)
+                    marginal_sim = cur_cost - schedule_cost_ms((F | U) - {num}, durations_ms)
+                    threshold = 0.90 if (not permanent and len(U) == 1) else 0.85
+                    if est >= threshold * marginal_sim:
+                        continue
+                elif permanent and len(U) <= 60:
                     cur_set = F | U
                     marginal_sim = cur_cost - schedule_cost_ms(cur_set - {num}, durations_ms)
                     if marginal_sim <= 0:
@@ -674,19 +687,23 @@ def _spawn_child(
                 ok = runner.run_one(tid)
                 t_after = _child_cpu_ms()
                 dt = max(0, t_after - t_before)
-                if mac > 20 and tid not in (TEST_EXECUTE_TPCDS, TEST_OPTIMIZED_TPCH, TEST_EXECUTE_TPCH):
+                if mac > 20 and tid not in (TEST_EXECUTE_TPCDS, TEST_OPTIMIZED_TPCH, TEST_EXECUTE_TPCH, TEST_MAX_NODES):
                     cal_actual += dt
                     cal_mac += mac
 
                 if ok:
                     U.remove(num)
-                    cur_cost = schedule_cost_ms(F | U, durations_ms)
+                    passes_since_cost += 1
+                    if len(U) <= 60 or permanent or passes_since_cost >= 24:
+                        cur_cost = schedule_cost_ms(F | U, durations_ms)
+                        passes_since_cost = 0
                 else:
                     U.remove(num)
                     F.add(num)
                     permanent.add(num)
                     perm_cost = schedule_cost_ms(permanent, durations_ms)
                     cur_cost = schedule_cost_ms(F | U, durations_ms)
+                    passes_since_cost = 0
 
             signal.alarm(0)
             final_set = F | U
@@ -785,7 +802,11 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
     # Reserve generous margin under 180s (40 commits) / 270s (60 commits)
     wall_budget_s = max(110.0, min(220.0, len(jobs) * 3.0))
     total_cpu_ms = 0
-    speed_ratio = 1.6  # Conservative initial ratio (server CPU vs Mac baseline)
+    if getattr(index, "mac_bench_ms", 0) > 0:
+        cur_bench = _bench_cpu_loop()
+        speed_ratio = max(0.7, min(2.4, cur_bench / index.mac_bench_ms))
+    else:
+        speed_ratio = 1.6  # Conservative initial ratio (server CPU vs Mac baseline)
     cal_actual_total = 0
     cal_mac_total = 0
 
@@ -827,10 +848,10 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
             if num in unverified:
                 if tid in NON_VERIFIABLE_IDS:
                     permanent.add(num)
-                elif tid == TEST_MAX_NODES and est >= 0.85 * dur:
-                    # Still allow fast prefix check if test_max_nodes is present
-                    pass
-                elif est >= dur and dur > 300:
+                elif tid == TEST_MAX_NODES:
+                    if est >= 0.90 * (dur + 2_000):
+                        permanent.add(num)
+                elif est >= 0.90 * (dur + 2_000):
                     permanent.add(num)
 
         cur_cost = schedule_cost_ms(sel, index.durations)

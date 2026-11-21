@@ -463,6 +463,7 @@ class Index:
         self.tpcds_baseline = extra.get("tpcds")
         self.tpch_opt_baseline = extra.get("tpch_opt")
         self.tpch_exec_count = extra.get("tpch_exec_count", 0)
+        self.mac_bench_ms = extra.get("mac_bench_ms", 0)
 
         # Per-checkout AST / source cache across commits in a batch
         self._source_cache: dict[str, tuple[str, ast.AST, Source]] = {}
@@ -780,6 +781,26 @@ class Index:
             narrow = self._narrow_test_file_edit(path, old_tree, old, removed, added, new)
             if narrow is not None:
                 return selected_mask | narrow
+            if path == "tests/dialects/test_dialect.py":
+                # Edits strictly inside class TestDialect only affect test_dialect.py itself
+                in_test_dialect = bool(removed or added)
+                for ln in removed:
+                    st = old.statement_at(ln)
+                    cls = old.class_of_node.get(id(st)) if st is not None else None
+                    if cls is None or cls.name != "TestDialect":
+                        in_test_dialect = False
+                        break
+                if in_test_dialect:
+                    for ln, anchor in added.items():
+                        st = new.statement_at(ln)
+                        cls = new.class_of_node.get(id(st)) if st is not None else None
+                        ost = old.statement_at(anchor)
+                        ocls = old.class_of_node.get(id(ost)) if ost is not None else None
+                        if cls is None or cls.name != "TestDialect" or ocls is None or ocls.name != "TestDialect":
+                            in_test_dialect = False
+                            break
+                if in_test_dialect and self.test_files_mask.get(path, 0):
+                    return selected_mask | self.test_files_mask[path]
             if path not in SHARED_TEST_FILES and self.test_files_mask.get(path, 0):
                 return selected_mask | self.test_files_mask[path]
             selected_mask |= self.test_files_mask.get(path, 0)

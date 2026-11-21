@@ -199,6 +199,16 @@ def build_tpcds_and_tpch_baseline(checkout: Path) -> dict:
     }
 
 
+def bench_cpu_loop() -> int:
+    t0 = resource.getrusage(resource.RUSAGE_SELF)
+    acc = 0
+    for _ in range(15):
+        acc += sum(i * i for i in range(40_000))
+    t1 = resource.getrusage(resource.RUSAGE_SELF)
+    _ = acc
+    return max(1, round(((t1.ru_utime - t0.ru_utime) + (t1.ru_stime - t0.ru_stime)) * 1000))
+
+
 def measure_baseline_cpu(checkout: Path, test_ids: list[str]) -> dict[str, int]:
     from runner import NON_VERIFIABLE_IDS, _ChildRunner, _make_lazy_pool_cls
 
@@ -260,6 +270,7 @@ def main() -> None:
         "static_importers": static_importers,
         "sqlglot_importers": sqlglot_importers,
         "baseline_cpu_ms": baseline_cpu_ms,
+        "mac_bench_ms": bench_cpu_loop(),
         **exec_base,
     }
     blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=9)
