@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import ast
 import concurrent.futures
+import importlib
 import os
 import pickle
 import resource
@@ -199,11 +200,200 @@ def build_tpcds_and_tpch_baseline(checkout: Path) -> dict:
     }
 
 
+def _build_class_defs_cache(checkout: Path) -> dict[str, set[tuple[int, str]]]:
+    cache: dict[str, set[tuple[int, str]]] = {}
+    for py in sorted((checkout / "sqlglot").rglob("*.py")):
+        rel = py.relative_to(checkout).as_posix()
+        try:
+            tree = ast.parse(py.read_text(encoding="utf-8"), filename=rel)
+            cache[rel] = {(n.lineno, n.name) for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+        except (OSError, SyntaxError):
+            cache[rel] = set()
+    return cache
+
+
+def _trace_import_in_fork(
+    mod_name: str, checkout: Path, class_defs: dict[str, set[tuple[int, str]]]
+) -> tuple[dict[str, set[int]], dict[str, set[tuple[int, str]]]]:
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(rfd)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        root_prefix = checkout.resolve().as_posix().rstrip("/") + "/"
+        lines: dict[str, set[int]] = defaultdict(set)
+        funcs: dict[str, set[tuple[int, str]]] = defaultdict(set)
+        code_cache: dict[object, tuple[str, tuple[int, str]] | None] = {}
+
+        def _info(code):
+            res = code_cache.get(code)
+            if res is not None:
+                return None if res is False else res
+            fn = code.co_filename
+            if not fn.startswith(root_prefix):
+                code_cache[code] = False
+                return None
+            rel = fn[len(root_prefix):]
+            if not rel.startswith("sqlglot/") or code.co_name == "<module>":
+                code_cache[code] = False
+                return None
+            if (code.co_firstlineno, code.co_name) in class_defs.get(rel, ()):
+                code_cache[code] = False
+                return None
+            val = (rel, (code.co_firstlineno, code.co_name))
+            code_cache[code] = val
+            return val
+
+        def on_start(code, off):
+            res = _info(code)
+            if res is not None:
+                funcs[res[0]].add(res[1])
+            return sys.monitoring.DISABLE
+
+        def on_line(code, ln):
+            res = _info(code)
+            if res is not None:
+                lines[res[0]].add(ln)
+            return sys.monitoring.DISABLE
+
+        tid = sys.monitoring.COVERAGE_ID
+        sys.monitoring.use_tool_id(tid, "extra_imp")
+        sys.monitoring.register_callback(tid, sys.monitoring.events.PY_START, on_start)
+        sys.monitoring.register_callback(tid, sys.monitoring.events.LINE, on_line)
+        sys.monitoring.set_events(tid, sys.monitoring.events.PY_START | sys.monitoring.events.LINE)
+        try:
+            importlib.import_module(mod_name)
+        except BaseException:
+            pass
+        sys.monitoring.set_events(tid, 0)
+        os.write(wfd, pickle.dumps((dict(lines), dict(funcs)), protocol=pickle.HIGHEST_PROTOCOL))
+        os.close(wfd)
+        os._exit(0)
+
+    os.close(wfd)
+    chunks = []
+    while True:
+        chunk = os.read(rfd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(rfd)
+    os.waitpid(pid, 0)
+    return pickle.loads(b"".join(chunks))
+
+
+def compute_import_trace(checkout: Path) -> dict:
+    """Trace which sqlglot lines/functions execute during isolated test-file and submodule imports."""
+    class_defs = _build_class_defs_cache(checkout)
+
+    # Run trace in a clean pre-sqlglot subprocess so sys.modules is unpolluted
+    def _run_batch_targets(targets: list[tuple[str, str]], preimport_sqlglot: bool) -> dict[str, tuple]:
+        out: dict[str, tuple] = {}
+        # Fork a clean manager process before sqlglot is imported if preimport_sqlglot is False
+        rfd, wfd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(rfd)
+            if preimport_sqlglot:
+                importlib.import_module("sqlglot")
+            res = {}
+            for key, mod_name in targets:
+                if preimport_sqlglot and mod_name in sys.modules:
+                    continue
+                res[key] = _trace_import_in_fork(mod_name, checkout, class_defs)
+            os.write(wfd, pickle.dumps(res, protocol=pickle.HIGHEST_PROTOCOL))
+            os.close(wfd)
+            os._exit(0)
+        os.close(wfd)
+        chunks = []
+        while True:
+            chunk = os.read(rfd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(rfd)
+        os.waitpid(pid, 0)
+        return pickle.loads(b"".join(chunks))
+
+    base_res = _run_batch_targets([("sqlglot", "sqlglot")], preimport_sqlglot=False)
+    base_lines, base_funcs = base_res["sqlglot"]
+
+    test_files = [
+        p.relative_to(checkout).as_posix()
+        for p in sorted((checkout / "tests").rglob("*.py"))
+        if p.name.startswith("test_") and p.name != "test_docs.py"
+    ]
+    test_targets = [(tf, tf[:-3].replace("/", ".")) for tf in test_files]
+
+    sqlglot_targets = []
+    for py in sorted((checkout / "sqlglot").rglob("*.py")):
+        rel = py.relative_to(checkout).as_posix()
+        if rel == "sqlglot/__main__.py":
+            continue
+        mod = rel[:-12].replace("/", ".") if rel.endswith("/__init__.py") else rel[:-3].replace("/", ".")
+        sqlglot_targets.append((rel, mod))
+
+    test_traces = _run_batch_targets(test_targets, preimport_sqlglot=False)
+    mod_traces = _run_batch_targets(sqlglot_targets, preimport_sqlglot=True)
+
+    sources = sorted(test_traces.keys()) + sorted(mod_traces.keys())
+    src_bit = {s: (1 << i) for i, s in enumerate(sources)}
+
+    line_src_mask: dict[tuple[str, int], int] = defaultdict(int)
+    func_src_mask: dict[tuple[str, tuple[int, str]], int] = defaultdict(int)
+
+    for src, (lmap, fmap) in {**test_traces, **mod_traces}.items():
+        bit = src_bit[src]
+        for rel, lns in lmap.items():
+            base_set = base_lines.get(rel, ())
+            for ln in lns:
+                if ln not in base_set:
+                    line_src_mask[(rel, ln)] |= bit
+        for rel, fks in fmap.items():
+            base_set = base_funcs.get(rel, ())
+            for fk in fks:
+                if fk not in base_set:
+                    func_src_mask[(rel, fk)] |= bit
+
+    mask_to_idx: dict[int, int] = {}
+    import_masks: list[int] = []
+
+    def _intern(m: int) -> int:
+        idx = mask_to_idx.get(m)
+        if idx is None:
+            idx = len(import_masks)
+            import_masks.append(m)
+            mask_to_idx[m] = idx
+        return idx
+
+    import_line_idx: dict[str, dict[int, int]] = defaultdict(dict)
+    for (rel, ln), m in line_src_mask.items():
+        import_line_idx[rel][ln] = _intern(m)
+
+    import_func_idx: dict[str, dict[tuple[int, str], int]] = defaultdict(dict)
+    for (rel, fk), m in func_src_mask.items():
+        import_func_idx[rel][fk] = _intern(m)
+
+    return {
+        "base_lines": {k: set(v) for k, v in base_lines.items()},
+        "base_funcs": {k: set(v) for k, v in base_funcs.items()},
+        "import_sources": sources,
+        "import_masks": import_masks,
+        "import_line_idx": dict(import_line_idx),
+        "import_func_idx": dict(import_func_idx),
+    }
+
+
 def bench_cpu_loop() -> int:
     t0 = resource.getrusage(resource.RUSAGE_SELF)
+    d = {f"k{i}": i for i in range(64)}
     acc = 0
-    for _ in range(15):
-        acc += sum(i * i for i in range(40_000))
+    for _ in range(300):
+        nodes = [(i, str(i), d.get(f"k{i & 63}", 0)) for i in range(400)]
+        acc += sum(x[0] + x[2] for x in nodes)
     t1 = resource.getrusage(resource.RUSAGE_SELF)
     _ = acc
     return max(1, round(((t1.ru_utime - t0.ru_utime) + (t1.ru_stime - t0.ru_stime)) * 1000))
@@ -238,6 +428,7 @@ def main() -> None:
     parser.add_argument("checkout", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--coverage", type=Path, default=Path("coverage.pkl.zlib"))
+    parser.add_argument("--reuse-from", type=Path, default=None)
     args = parser.parse_args()
 
     app_dir = str(Path(__file__).resolve().parent)
@@ -261,16 +452,31 @@ def main() -> None:
 
     print("Computing static_importers...", file=sys.stderr)
     static_importers, sqlglot_importers = compute_static_importers(checkout)
-    print("Building TPC-DS/TPC-H baselines...", file=sys.stderr)
-    exec_base = build_tpcds_and_tpch_baseline(checkout)
-    print(f"Measuring baseline CPU across {len(test_ids)} tests...", file=sys.stderr)
-    baseline_cpu_ms = measure_baseline_cpu(checkout, test_ids)
+    print("Tracing isolated import executions...", file=sys.stderr)
+    import_trace = compute_import_trace(checkout)
+
+    if args.reuse_from is not None and args.reuse_from.resolve().exists():
+        prev = pickle.loads(zlib.decompress(args.reuse_from.resolve().read_bytes()))
+        baseline_cpu_ms = prev["baseline_cpu_ms"]
+        mac_bench_ms = bench_cpu_loop()
+        exec_base = {
+            "tpcds": prev["tpcds"],
+            "tpch_opt": prev["tpch_opt"],
+            "tpch_exec_count": prev["tpch_exec_count"],
+        }
+    else:
+        print("Building TPC-DS/TPC-H baselines...", file=sys.stderr)
+        exec_base = build_tpcds_and_tpch_baseline(checkout)
+        print(f"Measuring baseline CPU across {len(test_ids)} tests...", file=sys.stderr)
+        baseline_cpu_ms = measure_baseline_cpu(checkout, test_ids)
+        mac_bench_ms = bench_cpu_loop()
 
     payload = {
         "static_importers": static_importers,
         "sqlglot_importers": sqlglot_importers,
+        "import_trace": import_trace,
         "baseline_cpu_ms": baseline_cpu_ms,
-        "mac_bench_ms": bench_cpu_loop(),
+        "mac_bench_ms": mac_bench_ms,
         **exec_base,
     }
     blob = zlib.compress(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), level=9)

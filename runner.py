@@ -63,7 +63,7 @@ CHILD_ALARM_SECONDS = 50
 
 # Warm common imports between groups of forks. The Docker build discovers
 # their transitive imports on the exact checkout used for verification.
-WARM_MODULES = ("sqlglot", "tests.dialects.test_dialect")
+WARM_MODULES = ("sqlglot", "tests.dialects.test_dialect", "tests.test_optimizer", "tests.test_executor")
 WARM_INDEX = Path(__file__).with_name("warm-imports.json")
 
 _DELETED_SENTINEL = object()
@@ -306,16 +306,19 @@ class _ChildRunner:
         os.environ["SKIP_INTEGRATION"] = "0"
         os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
-        need_pickle = any(
-            p == "sqlglot/serde.py"
-            or p.startswith("sqlglot/expressions/")
-            or p == "sqlglot/executor/table.py"
-            for p in self.patched_files
-        )
+        need_pickle = self._needs_pickle_overlay()
         pool_cls = _make_lazy_pool_cls(need_pickle)
         concurrent.futures.ProcessPoolExecutor = pool_cls
         concurrent.futures.wait = lambda fs, *a, **kw: (set(fs), set())
         concurrent.futures.as_completed = lambda fs, *a, **kw: iter(list(fs))
+        for mod in tuple(sys.modules.values()):
+            if mod is not None and getattr(mod, "__name__", "").startswith("tests."):
+                if hasattr(mod, "ProcessPoolExecutor"):
+                    setattr(mod, "ProcessPoolExecutor", pool_cls)
+                if hasattr(mod, "wait"):
+                    setattr(mod, "wait", concurrent.futures.wait)
+                if hasattr(mod, "as_completed"):
+                    setattr(mod, "as_completed", concurrent.futures.as_completed)
 
         _install_overlays(self.patched_files, self.checkout)
 
@@ -327,11 +330,17 @@ class _ChildRunner:
             for p in self.patched_files
         )
 
+    def _needs_tpcds_pickle_fallback(self) -> bool:
+        return any(
+            p == "sqlglot/serde.py" or p == "sqlglot/executor/table.py"
+            for p in self.patched_files
+        )
+
     def _can_fast_tpcds(self) -> bool:
         return (
             self.index is not None
             and self.index.tpcds_baseline is not None
-            and not self._needs_pickle_overlay()
+            and not self._needs_tpcds_pickle_fallback()
             and "tests/test_executor.py" not in self.patched_files
             and "tests/helpers.py" not in self.patched_files
             and "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" not in self.patched_files
@@ -341,27 +350,84 @@ class _ChildRunner:
         return (
             self.index is not None
             and self.index.tpch_opt_baseline is not None
-            and not self._needs_pickle_overlay()
+            and not self._needs_tpcds_pickle_fallback()
             and "tests/test_executor.py" not in self.patched_files
             and "tests/helpers.py" not in self.patched_files
             and "tests/fixtures/optimizer/tpc-h/tpc-h.sql" not in self.patched_files
         )
 
     def _run_fast_tpcds(self) -> bool:
+        import ast
         from pandas.testing import assert_frame_equal
+        import duckdb
         import numpy as np
         import pandas as pd
         from sqlglot import find_tables, parse_one, transpile
         from sqlglot.executor import execute
+        from sqlglot.executor.table import Table
         from sqlglot.optimizer import optimize
-        from tests.helpers import TPCDS_SCHEMA, load_sql_fixture_pairs
+        from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
 
         can_skip_unchanged_exec = not any(
             p.startswith(TPCDS_EXEC_SENSITIVE_PREFIXES) or p in TPCDS_EXEC_SENSITIVE_FILES
             for p in self.patched_files
         )
-        tpcds_tables = None
+        check_expr_pickle = any(p.startswith("sqlglot/expressions/") for p in self.patched_files)
+        tpcds_dir = f"{FIXTURES_DIR}/optimizer/tpc-ds/"
+        tpcds_tables: dict[str, Table] = {}
         tpcds_conn = None
+
+        def load_table(table_name: str) -> Table:
+            tbl = tpcds_tables.get(table_name)
+            if tbl is not None:
+                return tbl
+            file_name = f"{tpcds_dir}{table_name}.csv.gz"
+            with open(file_name, "rb") as fb:
+                is_gz = fb.read(2) == b"\x1f\x8b"
+            fobj = gzip.open(file_name, "rt", newline="") if is_gz else open(file_name, encoding="utf-8", newline="")
+            with fobj:
+                reader = csv.reader(fobj, delimiter="|")
+                next(reader)
+                rows = []
+                ctypes = []
+                for row in reader:
+                    if not ctypes:
+                        for v in row:
+                            try:
+                                ctypes.append(type(ast.literal_eval(v)))
+                            except (ValueError, SyntaxError):
+                                ctypes.append(str)
+                    rows.append(
+                        tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
+                    )
+            tbl = Table(columns=TPCDS_SCHEMA[table_name], rows=rows)
+            tpcds_tables[table_name] = tbl
+            return tbl
+
+        def get_duckdb_conn():
+            nonlocal tpcds_conn
+            if tpcds_conn is not None:
+                return tpcds_conn
+            tpcds_conn = duckdb.connect()
+            for table, columns in TPCDS_SCHEMA.items():
+                file_name = f"{tpcds_dir}{table}.csv.gz"
+                tpcds_conn.execute(
+                    f"CREATE VIEW {table} AS SELECT * FROM READ_CSV('{file_name}', delim='|', header=True, columns={columns})"
+                )
+            return tpcds_conn
+
+        def run_exec_item(p, duck_sql, base_duck_sql, base_df):
+            query_tables = {t.name: load_table(t.name) for t in find_tables(p)}
+            table = execute(p, schema=TPCDS_SCHEMA, tables=query_tables)
+            if duck_sql == base_duck_sql:
+                expected_df = base_df
+            else:
+                expected_df = get_duckdb_conn().execute(duck_sql).fetchdf()
+            actual_df = pd.DataFrame(
+                ((np.nan if c is None else c for c in r) for r in table.rows),
+                columns=table.columns,
+            )
+            assert_frame_equal(expected_df, actual_df, check_dtype=False, check_index_type=False)
 
         try:
             sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
@@ -369,42 +435,37 @@ class _ChildRunner:
             if len(sqls) != len(baseline):
                 return self.run_one(TEST_EXECUTE_TPCDS)
 
+            deferred = []
+            pickle_checked = not check_expr_pickle
             for i, (args, sql, _) in enumerate(sqls):
                 p = parse_one(sql)
                 if not args.get("execute"):
                     continue
+                if not pickle_checked:
+                    pickle.loads(pickle.dumps(p))
+                    pickle_checked = True
                 _, base_opt, _, base_duck_sql, base_df = baseline[i]
                 opt = optimize(p, schema=TPCDS_SCHEMA)
+                if check_expr_pickle and pickle_checked:
+                    pickle.loads(pickle.dumps(opt))
+                    check_expr_pickle = False
                 duck_sql = transpile(sql, write="duckdb")[0]
-                if can_skip_unchanged_exec and repr(opt) == base_opt and duck_sql == base_duck_sql:
-                    continue
+                if repr(opt) != base_opt or duck_sql != base_duck_sql:
+                    run_exec_item(p, duck_sql, base_duck_sql, base_df)
+                elif not can_skip_unchanged_exec:
+                    deferred.append((p, duck_sql, base_duck_sql, base_df))
 
-                if tpcds_tables is None:
-                    mod = self.loaded_modules.get("tests.test_executor")
-                    if mod is None:
-                        mod = importlib.import_module("tests.test_executor")
-                        self.loaded_modules["tests.test_executor"] = mod
-                    cls = getattr(mod, "TestExecutor")
-                    if not self.tpch_setup_done:
-                        cls.setUpClass()
-                        self.tpch_setup_done = True
-                    tpcds_tables = cls.tpcds_tables
-                    tpcds_conn = cls.tpcds_conn
-
-                query_tables = {t.name: tpcds_tables[t.name] for t in find_tables(p)}
-                table = execute(p, schema=TPCDS_SCHEMA, tables=query_tables)
-                if duck_sql == base_duck_sql:
-                    expected_df = base_df
-                else:
-                    expected_df = tpcds_conn.execute(duck_sql).fetchdf()
-                actual_df = pd.DataFrame(
-                    ((np.nan if c is None else c for c in r) for r in table.rows),
-                    columns=table.columns,
-                )
-                assert_frame_equal(expected_df, actual_df, check_dtype=False, check_index_type=False)
+            for p, duck_sql, base_duck_sql, base_df in deferred:
+                run_exec_item(p, duck_sql, base_duck_sql, base_df)
             return True
         except BaseException:
             return False
+        finally:
+            if tpcds_conn is not None:
+                try:
+                    tpcds_conn.close()
+                except Exception:
+                    pass
 
     def _run_fast_optimized_tpch(self) -> bool:
         try:
@@ -533,9 +594,11 @@ class _ChildRunner:
 
 def _bench_cpu_loop() -> int:
     t0 = resource.getrusage(resource.RUSAGE_SELF)
+    d = {f"k{i}": i for i in range(64)}
     acc = 0
-    for _ in range(15):
-        acc += sum(i * i for i in range(40_000))
+    for _ in range(300):
+        nodes = [(i, str(i), d.get(f"k{i & 63}", 0)) for i in range(400)]
+        acc += sum(x[0] + x[2] for x in nodes)
     t1 = resource.getrusage(resource.RUSAGE_SELF)
     _ = acc
     return max(1, round(((t1.ru_utime - t0.ru_utime) + (t1.ru_stime - t0.ru_stime)) * 1000))
@@ -560,8 +623,8 @@ def _est_cpu_ms(
         return round(30 * speed_ratio)
     if test_id == TEST_EXECUTE_TPCDS and tpcds_fast_avail:
         if not any(p.startswith(TPCDS_EXEC_SENSITIVE_PREFIXES) or p in TPCDS_EXEC_SENSITIVE_FILES for p in patched_files):
-            return round(1_300 * speed_ratio)
-        return round(7_200 * speed_ratio)
+            return round(1_500 * speed_ratio)
+        return round(12_500 * speed_ratio)
     if test_id == TEST_OPTIMIZED_TPCH and tpch_fast_avail:
         return round(30 * speed_ratio)
     if test_id == TEST_EXECUTE_TPCH and tpch_fast_avail:
@@ -573,6 +636,51 @@ def _est_cpu_ms(
     if cov_cpu_ms is not None and cov_cpu_ms > 0:
         return min(dur_ms, max(1, cov_cpu_ms))
     return dur_ms
+
+
+def _verifiable_sort_key(num: int, by_num: dict[int, tuple[str, int, int, int]]):
+    tid, dur, est, _ = by_num[num]
+    if tid == TEST_LAZY_LOAD:
+        return (0, 0.0, -dur, est, tid)
+    if tid == TEST_MAX_NODES:
+        return (3, 0.0, -dur, est, tid)
+    if est < 0.92 * dur:
+        return (1, -(dur / max(4, est)), -dur, est, tid.rsplit("::", 1)[0])
+    return (2, 0.0, -dur, est, tid.rsplit("::", 1)[0])
+
+
+def _best_prefix_net(
+    cur_set: set[int],
+    cur_cost: int,
+    rem: list[int],
+    by_num: dict[int, tuple[str, int, int, int]],
+    durations_ms: dict[int, int],
+    p_est: float,
+) -> float:
+    n = len(rem)
+    if n == 0:
+        return -1.0
+    ks = []
+    for k in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+        if k < n:
+            ks.append(k)
+    ks.append(n)
+
+    best = -1e18
+    pref_cpu = 0
+    prev_k = 0
+    drop_set: set[int] = set()
+    for k in ks:
+        for i in range(prev_k, k):
+            x = rem[i]
+            drop_set.add(x)
+            pref_cpu += by_num[x][2]
+        prev_k = k
+        sim_gain = cur_cost - schedule_cost_ms(cur_set - drop_set, durations_ms)
+        net = p_est * sim_gain - pref_cpu
+        if net > best:
+            best = net
+    return best
 
 
 class _AlarmTimeout(BaseException):
@@ -615,16 +723,11 @@ def _spawn_child(
             max_nodes_num = None
             for num in U:
                 tid, dur, est, mac = by_num[num]
-                if tid in NON_VERIFIABLE_IDS:
+                if tid in NON_VERIFIABLE_IDS or est >= 0.90 * (dur + 2_000):
                     permanent.add(num)
                 elif tid == TEST_MAX_NODES:
                     max_nodes_num = num
-                    if est < 0.90 * (dur + 2_000):
-                        verifiable.append(num)
-                    else:
-                        permanent.add(num)
-                elif est >= 0.90 * (dur + 2_000):
-                    permanent.add(num)
+                    verifiable.append(num)
                 else:
                     verifiable.append(num)
 
@@ -636,22 +739,48 @@ def _spawn_child(
                     if max_nodes_num in verifiable:
                         verifiable.remove(max_nodes_num)
 
-            # Run test_lazy_load FIRST (cold sqlglot), fast/heavy tests next, and full test_max_nodes LAST
-            verifiable.sort(
-                key=lambda n: (
-                    0 if by_num[n][0] == TEST_LAZY_LOAD else (2 if by_num[n][0] == TEST_MAX_NODES else 1),
-                    -by_num[n][1],
-                    by_num[n][2],
-                    by_num[n][0].rsplit("::", 1)[0],
-                )
-            )
+            verifiable.sort(key=lambda n: _verifiable_sort_key(n, by_num))
 
             cur_cost = schedule_cost_ms(F | U, durations_ms)
             perm_cost = schedule_cost_ms(permanent, durations_ms)
-            passes_since_cost = 0
+            eff_perm = set(permanent)
+
+            def _refresh_eff_perm():
+                nonlocal eff_perm
+                eff_perm = set(permanent)
+                if max_nodes_num is not None and max_nodes_num in U:
+                    mn_est = by_num[max_nodes_num][2]
+                    mn_upper = schedule_cost_ms(permanent | {max_nodes_num}, durations_ms) - perm_cost
+                    if mn_est >= 0.85 * mn_upper:
+                        eff_perm.add(max_nodes_num)
+
+            _refresh_eff_perm()
+            n_run = 0
+            n_pass = 0
+            n_fail = 0
+            passes_since_check = 0
+
+            def _should_stop_prefix() -> bool:
+                rem = [x for x in verifiable if x in U and x not in eff_perm]
+                if not rem:
+                    return True
+                rem_no_max = [x for x in rem if x != max_nodes_num]
+                p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4 and len(rem) >= 12) else 1.0
+                if rem_no_max:
+                    if _best_prefix_net(F | U, cur_cost, rem_no_max, by_num, durations_ms, p_est) > 0:
+                        return False
+                if max_nodes_num is not None and max_nodes_num in U and max_nodes_num not in eff_perm:
+                    mn_est = by_num[max_nodes_num][2]
+                    mn_marg = cur_cost - schedule_cost_ms((F | U) - {max_nodes_num}, durations_ms)
+                    if mn_est < 0.85 * p_est * mn_marg:
+                        return False
+                return True
+
+            if _should_stop_prefix():
+                verifiable = []
 
             for num in verifiable:
-                if num not in U:
+                if num not in U or num in eff_perm:
                     continue
                 if cur_cost <= perm_cost:
                     break
@@ -661,49 +790,53 @@ def _spawn_child(
 
                 tid, dur, est, mac = by_num[num]
                 if tid == TEST_MAX_NODES:
-                    # Recompute exact marginal gain right before committing ~13-27s CPU to test_max_nodes
                     cur_cost = schedule_cost_ms(F | U, durations_ms)
                     marginal_sim = cur_cost - schedule_cost_ms((F | U) - {num}, durations_ms)
+                    p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4) else 1.0
                     threshold = 0.90 if (not permanent and len(U) == 1) else 0.85
-                    if est >= threshold * marginal_sim:
+                    if est >= threshold * p_est * marginal_sim:
                         continue
-                elif permanent and len(U) <= 60:
+                elif est >= 0.92 * dur or (eff_perm and len(U) <= 40):
                     cur_set = F | U
                     marginal_sim = cur_cost - schedule_cost_ms(cur_set - {num}, durations_ms)
                     if marginal_sim <= 0:
                         continue
-                    if est > 0.90 * marginal_sim:
-                        rem_est = sum(
-                            by_num[x][2] for x in verifiable
-                            if x in U and by_num[x][2] <= 0.90 * by_num[x][1]
-                        )
-                        if rem_est >= 0.85 * (cur_cost - perm_cost):
-                            continue
-                elif not permanent:
-                    if est > 0.90 * cur_cost:
+                    if eff_perm and est > 0.92 * marginal_sim:
+                        rem = [x for x in verifiable if x in U and x not in eff_perm and x != max_nodes_num]
+                        p_est = (n_pass + 1.5) / (n_run + 3.0) if (n_run >= 6 and n_fail >= 4 and len(rem) >= 12) else 1.0
+                        if _best_prefix_net(cur_set, cur_cost, rem, by_num, durations_ms, p_est) <= 0:
+                            break
                         continue
 
                 t_before = _child_cpu_ms()
                 ok = runner.run_one(tid)
                 t_after = _child_cpu_ms()
                 dt = max(0, t_after - t_before)
+                n_run += 1
                 if mac > 20 and tid not in (TEST_EXECUTE_TPCDS, TEST_OPTIMIZED_TPCH, TEST_EXECUTE_TPCH, TEST_MAX_NODES):
                     cal_actual += dt
                     cal_mac += mac
 
                 if ok:
+                    n_pass += 1
                     U.remove(num)
-                    passes_since_cost += 1
-                    if len(U) <= 60 or permanent or passes_since_cost >= 24:
+                    passes_since_check += 1
+                    if len(U) <= 60 or permanent or passes_since_check >= 12:
                         cur_cost = schedule_cost_ms(F | U, durations_ms)
-                        passes_since_cost = 0
+                        passes_since_check = 0
+                        if _should_stop_prefix():
+                            break
                 else:
+                    n_fail += 1
                     U.remove(num)
                     F.add(num)
                     permanent.add(num)
                     perm_cost = schedule_cost_ms(permanent, durations_ms)
                     cur_cost = schedule_cost_ms(F | U, durations_ms)
-                    passes_since_cost = 0
+                    _refresh_eff_perm()
+                    passes_since_check = 0
+                    if _should_stop_prefix():
+                        break
 
             signal.alarm(0)
             final_set = F | U
@@ -815,22 +948,19 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
         fixed: set[int] = job.get("fixed_fails", set())
         unverified = sel - fixed
         pf = job["patched_files"]
-        need_pickle = any(
-            p == "sqlglot/serde.py"
-            or p.startswith("sqlglot/expressions/")
-            or p == "sqlglot/executor/table.py"
-            for p in pf
+        need_tpcds_fallback = any(
+            p == "sqlglot/serde.py" or p == "sqlglot/executor/table.py" for p in pf
         )
         tpcds_fast = (
             index.tpcds_baseline is not None
-            and not need_pickle
+            and not need_tpcds_fallback
             and "tests/test_executor.py" not in pf
             and "tests/helpers.py" not in pf
             and "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql" not in pf
         )
         tpch_fast = (
             index.tpch_opt_baseline is not None
-            and not need_pickle
+            and not need_tpcds_fallback
             and "tests/test_executor.py" not in pf
             and "tests/helpers.py" not in pf
             and "tests/fixtures/optimizer/tpc-h/tpc-h.sql" not in pf
@@ -838,6 +968,8 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
 
         items = []
         permanent = set(fixed)
+        verifiable = []
+        max_nodes_num = None
         for num in sel:
             tid = index.test_ids[num]
             dur = index.durations[num]
@@ -846,17 +978,34 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
             est = _est_cpu_ms(tid, dur, mac or None, cov, speed_ratio, pf, tpcds_fast, tpch_fast)
             items.append((num, tid, dur, est, mac))
             if num in unverified:
-                if tid in NON_VERIFIABLE_IDS:
+                if tid in NON_VERIFIABLE_IDS or est >= 0.90 * (dur + 2_000):
                     permanent.add(num)
                 elif tid == TEST_MAX_NODES:
-                    if est >= 0.90 * (dur + 2_000):
-                        permanent.add(num)
-                elif est >= 0.90 * (dur + 2_000):
-                    permanent.add(num)
+                    max_nodes_num = num
+                    verifiable.append(num)
+                else:
+                    verifiable.append(num)
 
         cur_cost = schedule_cost_ms(sel, index.durations)
         perm_cost = schedule_cost_ms(permanent, index.durations)
-        if cur_cost <= perm_cost and TEST_MAX_NODES not in (index.test_ids[n] for n in unverified):
+        if cur_cost <= perm_cost and max_nodes_num is None:
+            return None
+
+        by_num = {num: (tid, dur, est, mac) for num, tid, dur, est, mac in items}
+        mn_upper = (
+            schedule_cost_ms(permanent | {max_nodes_num}, index.durations) - perm_cost
+            if max_nodes_num is not None
+            else 0
+        )
+        mn_viable = max_nodes_num is not None and by_num[max_nodes_num][2] < 0.85 * mn_upper
+        rem_no_max = sorted(
+            (x for x in verifiable if x != max_nodes_num),
+            key=lambda n: _verifiable_sort_key(n, by_num),
+        )
+        if not mn_viable and (
+            not rem_no_max
+            or _best_prefix_net(sel, cur_cost, rem_no_max, by_num, index.durations, 1.0) <= 0
+        ):
             return None
 
         cap = min(PER_COMMIT_CPU_CAP_MS, TOTAL_CPU_CAP_MS - total_cpu_ms)
@@ -909,7 +1058,6 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
                     break
                 events = sel_io.select(timeout=1.0)
                 if not events:
-                    # Harvest any exited child or continue waiting
                     continue
                 for key, _ in events:
                     harvest(key.fd)
@@ -918,13 +1066,28 @@ def verify_batch(jobs: list[dict], index, checkout: Path) -> None:
 
     if WARM_INDEX.exists():
         warm_paths = json.loads(WARM_INDEX.read_bytes())
+        module_test_prefix = {
+            "tests.dialects.test_dialect": "tests/dialects/",
+            "tests.test_optimizer": "tests/test_optimizer.py::",
+            "tests.test_executor": "tests/test_executor.py::",
+        }
         for name in WARM_MODULES:
+            if name not in warm_paths:
+                continue
+            prefix = module_test_prefix.get(name)
+            if prefix is not None:
+                needers = sum(
+                    1 for j in pending
+                    if any(index.test_ids[n].startswith(prefix) for n in (j["selected"] - j.get("fixed_fails", set())))
+                )
+                if needers < 2:
+                    continue
             cold_paths = set(warm_paths[name])
             stage = []
             remaining = []
             for job in pending:
                 paths = job["patched_files"]
-                if cold_paths.intersection(paths) or any(not p.endswith(".py") for p in paths):
+                if cold_paths.intersection(paths):
                     stage.append(job)
                 else:
                     remaining.append(job)

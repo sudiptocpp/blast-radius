@@ -465,6 +465,34 @@ class Index:
         self.tpch_exec_count = extra.get("tpch_exec_count", 0)
         self.mac_bench_ms = extra.get("mac_bench_ms", 0)
 
+        import_trace = extra.get("import_trace") or {}
+        self.base_import_lines: dict[str, set[int]] = import_trace.get("base_lines", {})
+        self.base_import_funcs: dict[str, set[tuple[int, str]]] = import_trace.get("base_funcs", {})
+        self.import_line_idx: dict[str, dict[int, int]] = import_trace.get("import_line_idx", {})
+        self.import_func_idx: dict[str, dict[tuple[int, str], int]] = import_trace.get("import_func_idx", {})
+        import_sources = import_trace.get("import_sources", ())
+        import_masks = import_trace.get("import_masks", ())
+        src_resolved: list[int] = []
+        for src_name in import_sources:
+            if src_name.startswith("tests/"):
+                src_resolved.append(self.test_files_mask.get(src_name, 0))
+            else:
+                src_resolved.append(self.module_users_mask(src_name))
+        resolved_import_masks: list[int] = []
+        for smask in import_masks:
+            rm = 0
+            m = smask
+            while m:
+                lsb = m & -m
+                sr = src_resolved[lsb.bit_length() - 1]
+                if sr < 0:
+                    rm = -1
+                    break
+                rm |= sr
+                m ^= lsb
+            resolved_import_masks.append(rm)
+        self._resolved_import_masks = resolved_import_masks
+
         # Per-checkout AST / source cache across commits in a batch
         self._source_cache: dict[str, tuple[str, ast.AST, Source]] = {}
 
@@ -1010,15 +1038,39 @@ class Index:
         file_func_calls = self.func_calls.get(path, {})
         file_init_col = self.init_collection.get(path, {})
 
+        file_base_funcs = self.base_import_funcs.get(path, ())
+        file_base_lines = self.base_import_lines.get(path, ())
+        file_imp_funcs = self.import_func_idx.get(path, {})
+        file_imp_lines = self.import_line_idx.get(path, {})
+
         for fk in func_call_anchors:
             if fk in file_func_col:
-                return _module_fallback()
+                cols = file_func_col[fk]
+                if "*" in cols or fk in file_base_funcs or not self._resolved_import_masks:
+                    return _module_fallback()
+                idx = file_imp_funcs.get(fk)
+                if idx is None:
+                    return _module_fallback()
+                rm = self._resolved_import_masks[idx]
+                cm = self.collecting_mask(cols)
+                if rm < 0 or cm < 0:
+                    return _module_fallback()
+                selected_mask |= rm | cm
             selected_mask |= file_func_calls.get(fk, 0)
 
         for ln in func_line_anchors:
             if ln in file_init_col:
-                # Function line executed during collection (import time)
-                return _module_fallback()
+                cols = file_init_col[ln]
+                if "*" in cols or ln in file_base_lines or not self._resolved_import_masks:
+                    return _module_fallback()
+                idx = file_imp_lines.get(ln)
+                if idx is None:
+                    return _module_fallback()
+                rm = self._resolved_import_masks[idx]
+                cm = self.collecting_mask(cols)
+                if rm < 0 or cm < 0:
+                    return _module_fallback()
+                selected_mask |= rm | cm
             selected_mask |= file_func_lines.get(ln, 0)
 
         return selected_mask
